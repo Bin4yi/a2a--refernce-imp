@@ -20,3 +20,9 @@ authlib==1.3.0
 structlog==24.1.0
 python-multipart==0.0.9
 pyyaml==6.0.1
+
+# A2A Protocol
+a2a-sdk[http-server]>=0.1.0
+
+# MCP Protocol
+mcp>=1.0.0

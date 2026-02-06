@@ -13,8 +13,15 @@ import structlog
 
 from src.config import get_settings
 from src.auth.utils import generate_pkce, PKCEChallenge
+from src.log_broadcaster import log_and_broadcast
 
 logger = structlog.get_logger()
+
+
+# Use log_and_broadcast instead of print for visualizer integration
+def vlog(message: str):
+    """Log message and broadcast to visualizer."""
+    log_and_broadcast(message)
 
 
 @dataclass
@@ -93,9 +100,9 @@ class AsgardeoClient:
         query = urlencode(params)
         auth_url = f"{self.settings.asgardeo_authorize_url}?{query}"
         
-        print(f"\n[BUILD AUTH URL]")
-        print(f"  Requested Scopes: {all_scopes}")
-        print(f"  URL: {auth_url}")
+        vlog(f"\n[BUILD AUTH URL]")
+        vlog(f"  Requested Scopes: {all_scopes}")
+        vlog(f"  URL: {auth_url}")
         
         return auth_url
 
@@ -115,42 +122,49 @@ class AsgardeoClient:
                 "grant_type": "authorization_code",
                 "code": code,
                 "redirect_uri": self.settings.app_callback_url,
-                "client_id": self.settings.orchestrator_client_id,
-                "client_secret": self.settings.orchestrator_client_secret,
                 "code_verifier": code_verifier,
                 "actor_token": actor_token,
                 "actor_token_type": "urn:ietf:params:oauth:token-type:access_token"
             }
             
-            print(f"\n{'='*80}")
-            print(f"[EXCHANGE CODE FOR DELEGATED TOKEN]")
-            print(f"{'='*80}")
-            print(f"  Token URL: {self.settings.asgardeo_token_url}")
-            print(f"  Grant Type: authorization_code")
-            print(f"  Code: {code}")
-            print(f"  Redirect URI: {self.settings.app_callback_url}")
-            print(f"  Client ID: {self.settings.orchestrator_client_id}")
-            print(f"  Code Verifier: {code_verifier}")
-            print(f"  Actor Token: {actor_token[:50]}...")
-            print(f"{'='*80}")
+            vlog(f"\n{'='*80}")
+            vlog(f"[EXCHANGE CODE FOR DELEGATED TOKEN]")
+            vlog(f"{'='*80}")
+            vlog(f"  Token URL: {self.settings.asgardeo_token_url}")
+            vlog(f"  Grant Type: authorization_code")
+            vlog(f"  Code: {code}")
+            vlog(f"  Redirect URI: {self.settings.app_callback_url}")
+            vlog(f"  Client ID: {self.settings.orchestrator_client_id}")
+            vlog(f"  Code Verifier: {code_verifier}")
+            vlog(f"  Actor Token: {actor_token[:50]}...")
+            vlog(f"{'='*80}")
+            
+            # Use HTTP Basic Auth only (WSO2 IS rejects body + header auth together)
+            import base64
+            basic_auth = base64.b64encode(
+                f"{self.settings.orchestrator_client_id}:{self.settings.orchestrator_client_secret}".encode()
+            ).decode()
             
             response = await client.post(
                 self.settings.asgardeo_token_url,
                 data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {basic_auth}"
+                }
             )
             
-            print(f"\n[RESPONSE]")
-            print(f"  Status: {response.status_code}")
-            print(f"  Body: {response.text}")
+            vlog(f"\n[RESPONSE]")
+            vlog(f"  Status: {response.status_code}")
+            vlog(f"  Body: {response.text}")
 
             
             response.raise_for_status()
             
             result = response.json()
             
-            print(f"  Access Token: {result.get('access_token', '')[:50]}...")
-            print(f"  Scope: {result.get('scope', '')}")
+            vlog(f"  Access Token: {result.get('access_token', '')[:50]}...")
+            vlog(f"  Scope: {result.get('scope', '')}")
             
             logger.info("delegated_token_received", scope=result.get("scope"))
             
@@ -178,46 +192,96 @@ class AsgardeoClient:
 
     async def _fetch_agent_actor_token(self, client_id: str, client_secret: str, agent_id: str) -> ActorToken:
         """
-        Get an actor token for an agent using the 3-step flow.
-        Uses a fresh HTTP client each time (clears cookies).
-        
-        Step 1: POST /oauth2/authorize -> Get flowId
-        Step 2: POST /oauth2/authn with agent credentials -> Get auth code
-        Step 3: POST /oauth2/token -> Get actor token
+        Get an actor token for an agent via 3-step authorization_code flow.
+        Uses the passed client_id/client_secret for Steps 1 & 3.
+        - Orchestrator agent: pass orchestrator app credentials
+        - Worker agents: pass token exchanger app credentials
         """
-        pkce = generate_pkce()
-        
-        print(f"\n{'='*80}")
-        print(f"[3-STEP ACTOR TOKEN FLOW]")
-        print(f"  Agent ID: {agent_id}")
-        print(f"{'='*80}")
-        
-        # Use fresh client for each flow (clears cookies)
-        async with self._create_fresh_client() as client:
-            # Step 1: Initiate Auth Flow - Get flowId
-            flow_id = await self._initiate_auth_flow(client, client_id, pkce)
-            print(f"\n[STEP 1] Flow ID:")
-            print(f"  {flow_id}")
-            
-            # Step 2: Authenticate Agent
-            auth_code = await self._authenticate_agent(client, flow_id, agent_id)
-            print(f"\n[STEP 2] Auth Code:")
-            print(f"  {auth_code}")
-            
-            # Step 3: Exchange for Actor Token
-            actor_token = await self._exchange_code_for_actor_token(
-                client, client_id, client_secret, auth_code, pkce.verifier, agent_id
-            )
-            print(f"\n[STEP 3] ACTOR_TOKEN:")
-            print(f"  {actor_token.token}")
-            print(f"{'='*80}\n")
-            
-            return actor_token
+        vlog(f"\n{'='*80}")
+        vlog(f"[FETCHING AGENT ACTOR TOKEN]")
+        vlog(f"  Agent ID: {agent_id}")
+        vlog(f"{'='*80}")
 
-    async def _initiate_auth_flow(self, client: httpx.AsyncClient, client_id: str, pkce: PKCEChallenge) -> str:
+        # Lookup Agent Secret from Config
+        from src.config import get_settings
+        from src.config_loader import load_yaml_config
+        
+        # Reload config to ensure we have latest secrets
+        config = load_yaml_config()
+        agents = config.get("agents", {})
+        agent_secret = None
+        
+        for key, agent_config in agents.items():
+            if agent_config.get("agent_id") == agent_id:
+                agent_secret = agent_config.get("agent_secret")
+                vlog(f"  Found secret for {key}")
+                break
+            # Also check nested mcp_server config
+            mcp_cfg = agent_config.get("mcp_server", {})
+            if mcp_cfg.get("agent_id") == agent_id:
+                agent_secret = mcp_cfg.get("agent_secret")
+                vlog(f"  Found secret for {key}.mcp_server")
+                break
+        
+        # Fallback: Check if this is the Orchestrator Agent
+        if not agent_secret:
+            settings = get_settings()
+            if agent_id == settings.orchestrator_agent_id:
+                agent_secret = settings.orchestrator_agent_secret
+                vlog(f"  Using Orchestrator Agent credentials")
+            else:
+                vlog(f"[ERROR] No secret found for Agent ID: {agent_id}")
+        
+        # ─────────────────────────────────────────────────────────────
+        # Agent Authentication via 3-Step Authorization Code Flow
+        # Uses passed client_id/client_secret for Steps 1 & 3
+        # ─────────────────────────────────────────────────────────────
+        vlog(f"\n[3-STEP AUTHORIZATION CODE FLOW]")
+        vlog(f"  Application Client ID: {client_id}")
+        
+        try:
+            pkce = generate_pkce()
+            
+            # Use fresh client for each flow (clears cookies)
+            async with self._create_fresh_client() as fresh_client:
+                # Step 1: Initiate Auth Flow - Get flowId
+                flow_id = await self._initiate_auth_flow(
+                    fresh_client, 
+                    client_id,
+                    client_secret, 
+                    pkce
+                )
+                vlog(f"\n[STEP 1] Flow ID: {flow_id}")
+                
+                # Check if we got a code directly (session was active)
+                if flow_id.startswith("CODE:"):
+                    auth_code = flow_id[5:]  # Strip "CODE:" prefix
+                    vlog(f"\n[STEP 1] Got code directly (session active): {auth_code}")
+                else:
+                    # Step 2: Authenticate Agent with agent_id and agent_secret
+                    auth_code = await self._authenticate_agent(fresh_client, flow_id, agent_id)
+                    vlog(f"\n[STEP 2] Auth Code: {auth_code}")
+                
+                # Step 3: Exchange for Actor Token
+                actor_token = await self._exchange_code_for_actor_token(
+                    fresh_client, 
+                    client_id,
+                    client_secret,
+                    auth_code, 
+                    pkce.verifier, 
+                    agent_id
+                )
+                vlog(f"\n[STEP 3] ACTOR_TOKEN: {actor_token.token[:20]}...")
+                
+                return actor_token
+        except Exception as e:
+            vlog(f"\n[FATAL] Authorization code flow failed for agent {agent_id}")
+            raise e
+
+    async def _initiate_auth_flow(self, client: httpx.AsyncClient, client_id: str, client_secret: str, pkce: PKCEChallenge) -> str:
         """
-        Step 1: Initiate authorization flow.
-        POST /oauth2/authorize -> Returns flowId in JSON response
+        Step 1: Initiate authorization flow for AI Agent authentication.
+        POST /oauth2/authorize with response_mode=direct -> Returns JSON with flowId
         """
         data = {
             "response_type": "code",
@@ -225,23 +289,32 @@ class AsgardeoClient:
             "scope": "openid",
             "redirect_uri": self.settings.app_callback_url,
             "code_challenge": pkce.challenge,
-            "code_challenge_method": "S256"
+            "code_challenge_method": "S256",
+            "response_mode": "direct"
         }
         
-        print(f"\n  [Step 1] Calling: POST {self.settings.asgardeo_authorize_url}")
+        vlog(f"\n  [Step 1] Calling: POST {self.settings.asgardeo_authorize_url}")
+        
+        # Use HTTP Basic Auth (client_secret_basic) for WSO2 IS
+        import base64
+        basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
         
         response = await client.post(
             self.settings.asgardeo_authorize_url,
             data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "Authorization": f"Basic {basic_auth}"
+            }
         )
         
-        print(f"  [Step 1] Response status: {response.status_code}")
+        vlog(f"  [Step 1] Response status: {response.status_code}")
         
-        # Handle 302 redirect - extract flowId from redirect URL
+        # Handle 302 redirect - extract flowId/sessionDataKey from redirect URL
         if response.status_code == 302:
             location = response.headers.get("location", "")
-            print(f"  [Step 1] Redirect to: {location[:100]}...")
+            vlog(f"  [Step 1] Redirect to: {location[:100]}...")
             
             parsed = urlparse(location)
             query_params = parse_qs(parsed.query)
@@ -255,11 +328,28 @@ class AsgardeoClient:
                 return flow_id
             else:
                 raise ValueError(f"flowId not found in redirect: {location}")
-        else:
-            # JSON response
+        elif response.status_code == 200:
+            # JSON response with response_mode=direct
             result = response.json()
-            print(f"  [Step 1] Response: {result}")
-            return result.get("flowId") or result.get("flow_id")
+            flow_status = result.get("flowStatus")
+            vlog(f"  [Step 1] JSON Response: flowStatus={flow_status}")
+            
+            # If session is active, authorize may return SUCCESS_COMPLETED with code directly
+            if flow_status == "SUCCESS_COMPLETED":
+                direct_code = result.get("code") or result.get("authData", {}).get("code")
+                if direct_code:
+                    vlog(f"  [Step 1] Session active - got code directly: {direct_code}")
+                    # Return code as a special marker (caller should handle)
+                    return f"CODE:{direct_code}"
+            
+            flow_id = result.get("flowId")
+            if flow_id:
+                return flow_id
+            else:
+                raise ValueError(f"flowId not found in response: {result}")
+        else:
+            vlog(f"  [Step 1] Error: {response.text}")
+            raise ValueError(f"Failed to initiate auth flow: {response.status_code} {response.text}")
 
     async def _authenticate_agent(self, client: httpx.AsyncClient, flow_id: str, agent_id: str) -> str:
         """
@@ -273,19 +363,32 @@ class AsgardeoClient:
         # Find agent secret
         agent_secret = None
         agents = config.get("agents", {})
+        
+        vlog(f"\n  [Step 2] Looking up agent secret for agent_id: {agent_id}")
+        vlog(f"  [Step 2] Available agents in config: {list(agents.keys())}")
+        
         for key, agent_config in agents.items():
-            if agent_config.get("agent_id") == agent_id:
+            config_agent_id = agent_config.get("agent_id")
+            vlog(f"  [Step 2] Checking {key}: config agent_id={config_agent_id}")
+            if config_agent_id == agent_id:
                 agent_secret = agent_config.get("agent_secret")
+                vlog(f"  [Step 2] FOUND! agent_secret length: {len(agent_secret) if agent_secret else 0}")
                 break
         
         # Fallback: check if this is the orchestrator agent
         if not agent_secret and agent_id == self.settings.orchestrator_agent_id:
             agent_secret = self.settings.orchestrator_agent_secret
+            vlog(f"  [Step 2] Using orchestrator agent credentials")
+        
+        if not agent_secret:
+            vlog(f"  [Step 2] ERROR: No agent_secret found for {agent_id}")
+            raise ValueError(f"No agent_secret found for agent_id: {agent_id}")
         
         authn_url = f"{self.settings.asgardeo_base_url}/oauth2/authn"
         
-        print(f"\n  [Step 2] Calling: POST {authn_url}")
-        print(f"  [Step 2] Agent ID: {agent_id}")
+        vlog(f"\n  [Step 2] Calling: POST {authn_url}")
+        vlog(f"  [Step 2] Agent ID (username): {agent_id}")
+        vlog(f"  [Step 2] Agent Secret (password) first 3 chars: {agent_secret[:3]}...")
         
         # Proper WSO2 IS authn payload structure
         payload = {
@@ -299,7 +402,7 @@ class AsgardeoClient:
             }
         }
         
-        print(f"  [Step 2] Payload: flowId={flow_id}, username={agent_id}")
+        vlog(f"  [Step 2] Payload: flowId={flow_id}, username={agent_id}")
         
         response = await client.post(
             authn_url,
@@ -307,13 +410,13 @@ class AsgardeoClient:
             headers={"Content-Type": "application/json"}
         )
         
-        print(f"  [Step 2] Response status: {response.status_code}")
+        vlog(f"  [Step 2] Response status: {response.status_code}")
         
         # Handle different response types
         if response.status_code == 302:
             # Redirect contains the auth code
             location = response.headers.get("location", "")
-            print(f"  [Step 2] Redirect: {location[:100]}...")
+            vlog(f"  [Step 2] Redirect: {location[:100]}...")
             
             parsed = urlparse(location)
             query_params = parse_qs(parsed.query)
@@ -325,11 +428,13 @@ class AsgardeoClient:
                 raise ValueError(f"Auth code not found in redirect: {location}")
         elif response.status_code == 200:
             result = response.json()
-            print(f"  [Step 2] Response: {result}")
+            vlog(f"  [Step 2] Response: {result}")
             
-            # Check if we got the code directly or need to follow a redirect
+            # Check if we got the code directly, in authData, or need to follow a redirect
             if "code" in result:
                 return result["code"]
+            elif "authData" in result and "code" in result["authData"]:
+                return result["authData"]["code"]
             elif "authorizationCode" in result:
                 return result["authorizationCode"]
             elif "redirectUrl" in result:
@@ -343,7 +448,7 @@ class AsgardeoClient:
             raise ValueError(f"Auth code not found in response: {result}")
         else:
             error_text = response.text
-            print(f"  [Step 2] Error: {error_text}")
+            vlog(f"  [Step 2] Error: {error_text}")
             raise ValueError(f"Authentication failed: {response.status_code} - {error_text}")
 
     async def _exchange_code_for_actor_token(
@@ -355,28 +460,34 @@ class AsgardeoClient:
         verifier: str,
         agent_id: str
     ) -> ActorToken:
-        """Step 3: Exchange authorization code for actor token."""
+        """
+        Step 3: Exchange authorization code for actor token.
+        Includes audience parameter pointing to Token Exchanger.
+        """
         data = {
             "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": self.settings.app_callback_url,
             "client_id": client_id,
             "client_secret": client_secret,
-            "code_verifier": verifier
+            "code": code,
+            "redirect_uri": self.settings.app_callback_url,
+            "code_verifier": verifier,
         }
         
-        print(f"\n  [Step 3] Calling: POST {self.settings.asgardeo_token_url}")
+        vlog(f"\n  [Step 3] Calling: POST {self.settings.asgardeo_token_url}")
+        vlog(f"  [Step 3] Client ID: {client_id}")
         
         response = await client.post(
             self.settings.asgardeo_token_url,
             data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+            }
         )
         
-        print(f"  [Step 3] Response status: {response.status_code}")
+        vlog(f"  [Step 3] Response status: {response.status_code}")
         
         if response.status_code != 200:
-            print(f"  [Step 3] Error: {response.text}")
+            vlog(f"  [Step 3] Error: {response.text}")
         
         response.raise_for_status()
         
@@ -388,6 +499,69 @@ class AsgardeoClient:
             actor_id=agent_id,
             expires_at=datetime.utcnow() + timedelta(seconds=expires_in)
         )
+    # ─────────────────────────────────────────────────────────────────
+    # 2b. Agent Actor Token via Client Credentials + Agent Binding
+    # ─────────────────────────────────────────────────────────────────
+
+    async def get_agent_actor_token_credentials(
+        self,
+        client_id: str,
+        client_secret: str,
+        agent_id: str,
+        agent_secret: str
+    ) -> ActorToken:
+        """
+        Get an agent's actor token using client credentials grant with agent binding.
+        This is for worker agents that are registered as agents (not users) in WSO2 IS.
+        
+        Uses: POST /oauth2/token with grant_type=client_credentials and agent binding.
+        """
+        vlog(f"\n{'='*80}")
+        vlog(f"[AGENT ACTOR TOKEN - CLIENT CREDENTIALS]")
+        vlog(f"  Application Client ID: {client_id}")
+        vlog(f"  Agent ID: {agent_id}")
+        vlog(f"{'='*80}")
+        
+        async with self._create_fresh_client() as client:
+            # Client credentials grant with agent binding
+            data = {
+                "grant_type": "client_credentials",
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scope": "openid",
+                "agent_id": agent_id,
+                "agent_secret": agent_secret
+            }
+            
+            vlog(f"\n[REQUEST]")
+            vlog(f"  URL: POST {self.settings.asgardeo_token_url}")
+            vlog(f"  grant_type: client_credentials")
+            vlog(f"  agent_id: {agent_id}")
+            
+            response = await client.post(
+                self.settings.asgardeo_token_url,
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            vlog(f"\n[RESPONSE]")
+            vlog(f"  Status: {response.status_code}")
+            
+            if response.status_code != 200:
+                vlog(f"  Error: {response.text}")
+                raise ValueError(f"Failed to get agent actor token: {response.status_code} - {response.text}")
+            
+            result = response.json()
+            expires_in = result.get("expires_in", 3600)
+            
+            vlog(f"  Access Token: {result.get('access_token', '')[:50]}...")
+            vlog(f"{'='*80}\n")
+            
+            return ActorToken(
+                token=result["access_token"],
+                actor_id=agent_id,
+                expires_at=datetime.utcnow() + timedelta(seconds=expires_in)
+            )
 
     # ─────────────────────────────────────────────────────────────────
     # 3. Token Exchange (RFC 8693)
@@ -410,8 +584,6 @@ class AsgardeoClient:
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "subject_token": subject_token,
                 "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                "client_id": client_id,
-                "client_secret": client_secret,
             }
             
             if actor_token:
@@ -424,32 +596,38 @@ class AsgardeoClient:
             if target_scopes:
                 data["scope"] = " ".join(target_scopes)
             
-            print(f"\n{'='*80}")
-            print(f"[TOKEN EXCHANGE]")
-            print(f"  Client: {client_id}")
-            print(f"  Audience: {target_audience}")
-            print(f"  Scopes: {target_scopes}")
-            print(f"{'='*80}")
-            print(f"\n[SUBJECT_TOKEN]:")
-            print(f"  {subject_token}")
+            vlog(f"\n{'='*80}")
+            vlog(f"[TOKEN EXCHANGE]")
+            vlog(f"  Client: {client_id}")
+            vlog(f"  Audience: {target_audience}")
+            vlog(f"  Scopes: {target_scopes}")
+            vlog(f"{'='*80}")
+            vlog(f"\n[SUBJECT_TOKEN]:")
+            vlog(f"  {subject_token}")
             if actor_token:
-                print(f"\n[ACTOR_TOKEN]:")
-                print(f"  {actor_token}")
+                vlog(f"\n[ACTOR_TOKEN]:")
+                vlog(f"  {actor_token}")
 
+            # Use HTTP Basic Auth only (WSO2 IS rejects body + header auth together)
+            import base64
+            basic_auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
                 
             response = await client.post(
                 self.settings.asgardeo_token_url,
                 data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"}
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Authorization": f"Basic {basic_auth}"
+                }
             )
             response.raise_for_status()
             
             result = response.json()
             exchanged_token = result["access_token"]
             
-            print(f"\n[EXCHANGED_TOKEN]:")
-            print(f"  {exchanged_token}")
-            print(f"{'='*80}\n")
+            vlog(f"\n[EXCHANGED_TOKEN]:")
+            vlog(f"  {exchanged_token}")
+            vlog(f"{'='*80}\n")
             
             return exchanged_token
 

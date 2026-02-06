@@ -50,9 +50,16 @@ def load_yaml_config(path: str = "config.yaml") -> dict[str, Any]:
     Returns:
         Configuration dictionary with resolved env vars
     """
-    # Load .env file first
+    # Load .env file first (force reload to get latest values)
     from dotenv import load_dotenv
-    load_dotenv()
+    load_dotenv(override=True)
+    
+    # Debug: Check if HR_AGENT_ID is loaded correctly
+    hr_id = os.getenv("HR_AGENT_ID")
+    if hr_id:
+        logger.info(f"Loaded HR_AGENT_ID from env: {hr_id}")
+    else:
+        logger.warning("HR_AGENT_ID not found in env")
     
     try:
         with open(path, "r") as f:

@@ -43,6 +43,14 @@ agents:
     target_audience: "onboarding-api"
     agent_id: "${IT_AGENT_ID}"
     agent_secret: "${IT_AGENT_SECRET}"
+    # IT Agent routes through MCP Server instead of calling API directly
+    # MCP Server is also registered as AI Agent in WSO2 IS
+    mcp_server:
+      url: "http://localhost:8012"
+      client_id: "${MCP_IT_CLIENT_ID}"
+      client_secret: "${MCP_IT_CLIENT_SECRET}"
+      agent_id: "${MCP_IT_AGENT_ID}"
+      agent_secret: "${MCP_IT_AGENT_SECRET}"
     skills:
       - id: "provision_vpn"
         name: "Provision VPN"
