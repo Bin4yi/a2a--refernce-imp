@@ -87,23 +87,30 @@ OPENAI_API_KEY = settings.openai_api_key
 # Token Exchange (simplified — no actor token)
 # ─────────────────────────────────────────────────────────────────
 
+
 async def exchange_token_for_scope(
     subject_token: str,
-    target_scope: str
+    target_scope: str,
+    target_audience: str = None
 ) -> str:
     """
-    Exchange the incoming IT token for a narrowed-scope token.
+    Exchange the incoming IT token for a narrowed-scope token with optional audience binding.
     
-    Uses RFC 8693 Token Exchange WITHOUT actor token:
+    Uses RFC 8693 Token Exchange WITH actor token:
       - subject_token: The IT Agent's token (it:read + it:write)
+      - actor_token: Same as subject for scope narrowing
       - client credentials: Token Exchanger app (TOKEN_EXCHANGER_CLIENT_ID)
-      - requested scope: narrowed (e.g., just "it:read" or "it:write")
+      - requested scope: narrowed (e.g., just "it:write")
+      - audience: API-specific audience (e.g., "vpn-api", "github-api")
     
-    WSO2 IS supports this simplified exchange for scope narrowing.
-    No actor token needed — just the Token Exchanger authenticates
-    and requests a narrower scope from the subject token.
+    This ensures each API gets a token specifically bound to it.
     
-    Returns: A new access token with only the requested scope.
+    Args:
+        subject_token: IT Agent's broad token
+        target_scope: Narrowed scope (e.g., "it:write")
+        target_audience: Optional API-specific audience for token binding
+    
+    Returns: A new access token with narrowed scope and optional audience binding.
     """
     if not TOKEN_EXCHANGER_CLIENT_ID or not TOKEN_EXCHANGER_CLIENT_SECRET:
         raise ValueError("Token Exchanger credentials not configured")
@@ -113,6 +120,8 @@ async def exchange_token_for_scope(
     await vlog(f"{'#'*80}")
     await vlog(f"Token Exchanger App: {TOKEN_EXCHANGER_CLIENT_ID}")
     await vlog(f"Target Scope: {target_scope}")
+    if target_audience:
+        await vlog(f"Target Audience: {target_audience}")
     
     await vlog(f"\n[SOURCE_TOKEN (from IT Agent)]:")
     await vlog(f"{subject_token}")
@@ -132,6 +141,8 @@ async def exchange_token_for_scope(
     await vlog(f"  Subject: IT Agent Token")
     await vlog(f"  Token Exchanger App: {TOKEN_EXCHANGER_CLIENT_ID}")
     await vlog(f"  Target Scope: {target_scope}")
+    if target_audience:
+        await vlog(f"  Target Audience: {target_audience}")
     await vlog(f"  Token URL: {TOKEN_URL}")
     
     basic_auth = base64.b64encode(
@@ -147,6 +158,10 @@ async def exchange_token_for_scope(
         "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
         "scope": target_scope,
     }
+    
+    # Add audience if specified for API-specific token binding
+    if target_audience:
+        data["audience"] = target_audience
 
     async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
         response = await client.post(
@@ -197,17 +212,26 @@ async def call_it_api(
     path: str,
     token: str,
     target_scope: str,
+    target_audience: str = None,
     json_data: dict = None
 ) -> dict:
     """
-    Exchange token for narrowed scope, then call the IT API.
+    Exchange token for narrowed scope and API-specific audience, then call the IT API.
     
-    1. Exchange broad token -> narrowed token (via Token Exchanger)
+    1. Exchange broad token -> narrowed token with API-specific audience
     2. Call IT API with narrowed token
+    
+    Args:
+        method: HTTP method
+        path: API path
+        token: IT Agent's token
+        target_scope: Narrowed scope
+        target_audience: API-specific audience (e.g., "vpn-api")
+        json_data: Request payload
     """
-    # Step 1: Exchange token to narrow scope
+    # Step 1: Exchange token to narrow scope and bind to API audience
     try:
-        narrowed_token = await exchange_token_for_scope(token, target_scope)
+        narrowed_token = await exchange_token_for_scope(token, target_scope, target_audience)
     except Exception as e:
         logger.error(f"[MCP_IT] Token exchange failed: {e}")
         return {"success": False, "error": f"Token exchange failed: {str(e)}"}
@@ -246,13 +270,14 @@ async def call_it_api(
 # ─────────────────────────────────────────────────────────────────
 
 async def _provision_vpn(employee_id: str, token: str, vpn_profile: str = "standard") -> dict:
-    """Provision VPN access — exchanges token to it:write scope."""
+    """Provision VPN access — exchanges token to it:write scope with onboarding-api audience."""
     logger.info(f"[MCP_IT] Internal: provision_vpn for {employee_id}")
     return await call_it_api(
         method="POST",
         path="/provision/vpn",
         token=token,
         target_scope="it:write",
+        target_audience="onboarding-api",
         json_data={"employee_id": employee_id, "vpn_profile": vpn_profile}
     )
 
@@ -263,13 +288,14 @@ async def _provision_github(
     repositories: list = None,
     permission: str = "write"
 ) -> dict:
-    """Provision GitHub access — exchanges token to it:write scope."""
+    """Provision GitHub access — exchanges token to it:write scope with onboarding-api audience."""
     logger.info(f"[MCP_IT] Internal: provision_github for {employee_id}")
     return await call_it_api(
         method="POST",
         path="/provision/github",
         token=token,
         target_scope="it:write",
+        target_audience="onboarding-api",
         json_data={
             "employee_id": employee_id,
             "organization": organization,
@@ -284,25 +310,27 @@ async def _provision_aws(
     account: str = "nebulasoft-dev",
     role: str = "developer"
 ) -> dict:
-    """Provision AWS access — exchanges token to it:write scope."""
+    """Provision AWS access — exchanges token to it:write scope with onboarding-api audience."""
     logger.info(f"[MCP_IT] Internal: provision_aws for {employee_id}")
     return await call_it_api(
         method="POST",
         path="/provision/aws",
         token=token,
         target_scope="it:write",
+        target_audience="onboarding-api",
         json_data={"employee_id": employee_id, "account": account, "role": role}
     )
 
 
 async def _list_provisions(employee_id: str, token: str) -> dict:
-    """List provisions — exchanges token to it:read scope."""
+    """List provisions — exchanges token to it:read scope with onboarding-api audience."""
     logger.info(f"[MCP_IT] Internal: list_provisions for {employee_id}")
     return await call_it_api(
         method="GET",
         path=f"/provisions/{employee_id}",
         token=token,
-        target_scope="it:read"
+        target_scope="it:read",
+        target_audience="onboarding-api"
     )
 
 
