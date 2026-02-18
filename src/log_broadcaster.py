@@ -40,6 +40,12 @@ def broadcast_log_sync(message: str):
 
 # Simple print wrapper that also broadcasts
 def log_and_broadcast(message: str):
-    """Print message and also send to visualizer."""
-    print(message)
+    """Print message to stderr and also send to visualizer.
+    
+    IMPORTANT: Must use stderr, not stdout.
+    MCP STDIO protocol reserves stdout exclusively for JSON-RPC messages.
+    Any non-JSON output to stdout will corrupt the MCP protocol channel.
+    """
+    import sys
+    print(message, file=sys.stderr)
     broadcast_log_sync(message)

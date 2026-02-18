@@ -339,7 +339,7 @@ async def _list_provisions(employee_id: str, token: str) -> dict:
 # ─────────────────────────────────────────────────────────────────
 
 ROUTING_SYSTEM_PROMPT = """You are an IT provisioning request classifier for an MCP server.
-Given a natural language IT request, you must classify it into exactly ONE action and extract parameters.
+Given a natural language IT request, classify it into ONE OR MORE actions and extract parameters.
 
 Available actions:
 1. "provision_vpn" - Set up VPN access for an employee
@@ -349,21 +349,42 @@ Available actions:
 
 You must respond with ONLY a JSON object (no markdown, no explanation):
 {
-  "action": "<one of: provision_vpn, provision_github, provision_aws, list_provisions>",
-  "employee_id": "<extracted employee ID or 'EMP-NEW-001' if not found>",
-  "params": {<any additional parameters extracted from the request>}
+  "actions": [
+    {
+      "action": "<provision_vpn, provision_github, provision_aws, or list_provisions>",
+      "employee_id": "<extracted employee ID or 'EMP-NEW-001' if not found>",
+      "params": {<any additional parameters>}
+    }
+  ]
 }
 
 Rules:
-- If the request mentions VPN, network access, or remote access -> provision_vpn
-- If the request mentions GitHub, git, repository, code access -> provision_github
-- If the request mentions AWS, cloud, IAM, S3, EC2 -> provision_aws
-- If the request mentions list, show, check, status, existing -> list_provisions
-- If the request says "all IT accounts" or "set up everything", pick provision_vpn (first of multiple)
+- If the request mentions MULTIPLE operations (e.g., "VPN, GitHub, and AWS"), return MULTIPLE action objects
+- If the request mentions VPN, network access, or remote access -> include provision_vpn
+- If the request mentions GitHub, git, repository, code access -> include provision_github
+- If the request mentions AWS, cloud, IAM, S3, EC2 -> include provision_aws
+- If the request mentions list, show, check, status, existing -> include list_provisions
 - Extract employee IDs that match pattern EMP-XXXX or similar
 - For github params, extract: organization, repositories (as list), permission
 - For aws params, extract: account, role
 - For vpn params, extract: vpn_profile
+
+Examples:
+Request: "Provision VPN, GitHub, and AWS access for Alice"
+Response: {
+  "actions": [
+    {"action": "provision_vpn", "employee_id": "EMP-NEW-001", "params": {}},
+    {"action": "provision_github", "employee_id": "EMP-NEW-001", "params": {}},
+    {"action": "provision_aws", "employee_id": "EMP-NEW-001", "params": {}}
+  ]
+}
+
+Request: "Set up VPN for Bob"
+Response: {
+  "actions": [
+    {"action": "provision_vpn", "employee_id": "EMP-NEW-001", "params": {}}
+  ]
+}
 """
 
 
@@ -461,7 +482,7 @@ async def handle_it_request(
     await vlog(f"{'#'*80}")
     await vlog(f"  Request: {request}")
 
-    # Step 1: LLM classifies the request
+    # Step 1: LLM classifies the request into one or more actions
     await vlog(f"\n[MCP LLM ROUTING] Classifying request via gpt-4o-mini...")
     try:
         classification = await classify_request(request)
@@ -469,78 +490,96 @@ async def handle_it_request(
         await vlog(f"  [MCP LLM ERROR] Classification failed: {e}")
         return json.dumps({"success": False, "error": f"Request classification failed: {str(e)}"})
 
-    action = classification.get("action", "")
-    employee_id = classification.get("employee_id", "EMP-NEW-001")
-    params = classification.get("params", {})
+    # Handle both old (single action) and new (actions array) formats
+    actions = classification.get("actions", [])
+    if not actions:
+        # Backward compatibility: check if old single-action format
+        if "action" in classification:
+            await vlog(f"  [MCP LLM] Detected old format, converting to new format")
+            actions = [{
+                "action": classification["action"],
+                "employee_id": classification.get("employee_id", "EMP-NEW-001"),
+                "params": classification.get("params", {})
+            }]
+        else:
+            return json.dumps({"success": False, "error": "No actions classified from request"})
 
-    await vlog(f"  [MCP LLM RESULT] Action: {action}")
-    await vlog(f"  [MCP LLM RESULT] Employee: {employee_id}")
-    await vlog(f"  [MCP LLM RESULT] Params: {json.dumps(params)}")
+    await vlog(f"  [MCP LLM RESULT] Found {len(actions)} action(s)")
 
-    # Step 2: Route to the correct internal operation
-    if action == "provision_vpn":
-        result = await _provision_vpn(
-            employee_id=employee_id,
-            token=token,
-            vpn_profile=params.get("vpn_profile", "standard")
-        )
-        scope_info = "it:read+it:write -> it:write"
+    # Step 2: Execute all identified actions (each gets its own token exchange)
+    results = []
+    for idx, action_obj in enumerate(actions):
+        action = action_obj.get("action", "")
+        employee_id = action_obj.get("employee_id", "EMP-NEW-001")
+        params = action_obj.get("params", {})
 
-    elif action == "provision_github":
-        repos = params.get("repositories", ["main-app", "docs"])
-        if isinstance(repos, str):
-            repos = [r.strip() for r in repos.split(",")]
-        result = await _provision_github(
-            employee_id=employee_id,
-            token=token,
-            organization=params.get("organization", "nebulasoft"),
-            repositories=repos,
-            permission=params.get("permission", "write")
-        )
-        scope_info = "it:read+it:write -> it:write"
+        await vlog(f"\n  [MCP ACTION {idx+1}/{len(actions)}]")
+        await vlog(f"    Action: {action}")
+        await vlog(f"    Employee: {employee_id}")
+        await vlog(f"    Params: {json.dumps(params)}")
 
-    elif action == "provision_aws":
-        result = await _provision_aws(
-            employee_id=employee_id,
-            token=token,
-            account=params.get("account", "nebulasoft-dev"),
-            role=params.get("role", "developer")
-        )
-        scope_info = "it:read+it:write -> it:write"
+        # Route to the correct internal operation
+        if action == "provision_vpn":
+            result = await _provision_vpn(
+                employee_id=employee_id,
+                token=token,
+                vpn_profile=params.get("vpn_profile", "standard")
+            )
+            scope_info = "it:read+it:write -> it:write"
 
-    elif action == "list_provisions":
-        result = await _list_provisions(
-            employee_id=employee_id,
-            token=token
-        )
-        scope_info = "it:read+it:write -> it:read"
+        elif action == "provision_github":
+            repos = params.get("repositories", ["main-app", "docs"])
+            if isinstance(repos, str):
+                repos = [r.strip() for r in repos.split(",")]
+            result = await _provision_github(
+                employee_id=employee_id,
+                token=token,
+                organization=params.get("organization", "nebulasoft"),
+                repositories=repos,
+                permission=params.get("permission", "write")
+            )
+            scope_info = "it:read+it:write -> it:write"
 
-    else:
-        result = {
-            "success": False,
-            "error": f"Unknown action '{action}' classified by LLM"
-        }
-        scope_info = "none"
+        elif action == "provision_aws":
+            result = await _provision_aws(
+                employee_id=employee_id,
+                token=token,
+                account=params.get("account", "nebulasoft-dev"),
+                role=params.get("role", "developer")
+            )
+            scope_info = "it:read+it:write -> it:write"
 
-    # Add routing metadata to result
-    if isinstance(result, dict):
-        result["_routing"] = {
-            "action": action,
-            "employee_id": employee_id,
-            "scope_narrowed": scope_info,
-            "classified_by": "LLM (gpt-4o-mini)",
-            "params_extracted": params
-        }
+        elif action == "list_provisions":
+            result = await _list_provisions(
+                employee_id=employee_id,
+                token=token
+            )
+            scope_info = "it:read+it:write -> it:read"
 
-    await vlog(f"\n[MCP SERVER RESULT] Success: {result.get('success', False)}")
-    await vlog(f"  Action: {action} | Scope: {scope_info}")
-    if result.get("success"):
-        await vlog(f"  Provision ID: {result.get('provision_id', 'N/A')}")
-    else:
-        await vlog(f"  Error: {result.get('error', 'N/A')}")
-    await vlog(f"{'#'*80}\n")
+        else:
+            result = {
+                "success": False,
+                "error": f"Unknown action '{action}' classified by LLM"
+            }
+            scope_info = "none"
 
-    return json.dumps(result)
+        # Add routing metadata to each result
+        if isinstance(result, dict):
+            result["_routing"] = {
+                "action": action,
+                "employee_id": employee_id,
+                "scope_narrowing": scope_info,
+                "routed_by": "LLM (gpt-4o-mini)"
+            }
+
+        results.append(result)
+
+    # Return combined results
+    return json.dumps({
+        "success": all(r.get("success", False) for r in results),
+        "actions_executed": len(results),
+        "results": results
+    }, indent=2)
 
 
 # Also expose individual tools for direct invocation (bypasses LLM routing)
@@ -641,10 +680,36 @@ async def list_provisions(
 # ─────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--transport", choices=["stdio", "sse"], default="stdio")
+    parser.add_argument("--port", type=int, default=8003)
+    args = parser.parse_args()
+
     print(f"\n🔧 Starting IT MCP Server (LLM-routed)", file=sys.stderr)
-    print(f"   Transport: stdio", file=sys.stderr)
+    print(f"   Transport: {args.transport}", file=sys.stderr)
     print(f"   IT API Target: {IT_API_BASE}", file=sys.stderr)
     print(f"   Token Exchanger: {TOKEN_EXCHANGER_CLIENT_ID}", file=sys.stderr)
     print(f"   LLM Router: gpt-4o-mini", file=sys.stderr)
     print(f"   Tools: handle_it_request (smart), provision_vpn, provision_github, provision_aws, list_provisions", file=sys.stderr)
-    mcp.run()
+
+    if args.transport == "sse":
+        import uvicorn
+        from starlette.middleware.cors import CORSMiddleware
+
+        print(f"   SSE URL: http://localhost:{args.port}/sse", file=sys.stderr)
+        print(f"   CORS: enabled for MCP Inspector", file=sys.stderr)
+
+        # Get the underlying Starlette app from FastMCP and wrap with CORS
+        sse_app = mcp.sse_app()
+        sse_app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+
+        uvicorn.run(sse_app, host="127.0.0.1", port=args.port)
+    else:
+        mcp.run(transport="stdio")
+
